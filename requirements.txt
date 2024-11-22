@@ -1,3 +1,4 @@
+setuptools>=40.8.0
 streamlit
 fastapi
 uvicorn
@@ -6,6 +7,6 @@ PyPDF2
 langchain-google-genai
 langchain_community
 google-generativeai
-dotenv
+python-dotenv
 pydantic
 faiss-cpu
