@@ -14,12 +14,31 @@ from fastapi import HTTPException  # type: ignore
 from pydantic import BaseModel
 from typing import List , Optional
 from fastapi.middleware.cors import CORSMiddleware # type: ignore
+from contextlib import asynccontextmanager
+from loguru import logger
+import sys
+from pathlib import Path
 
 # this is a test
 
 load_dotenv()
-os.getenv("GOOGLE_API_KEY")
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    logger.error("GOOGLE_API_KEY not found in environment variables")
+    sys.exit(1)
+
+genai.configure(api_key=GOOGLE_API_KEY)
+
+PORT = int(os.getenv("PORT", "8000"))
+
+source_dir = Path("source")
+source_dir.mkdir(exist_ok=True)
+
+pdf_paths = []
+if os.path.exists(source_dir):
+    pdf_paths = [str(p) for p in source_dir.glob("*.pdf")]
+    if not pdf_paths:
+        logger.warning("No PDF files found in source directory")
 
 def get_pdf_text(pdf_docs):
     text = ""
@@ -63,7 +82,30 @@ def user_input(user_question):
     response = chain({"input_documents": docs, "question": user_question}, return_only_outputs=True)
     return response["output_text"]
 
-app = fastapi.FastAPI()
+@asynccontextmanager
+async def lifespan(app: fastapi.FastAPI):
+    # Initialize vector store
+    global vector_store, vector_store_loaded
+    raw_text = ""
+    try:
+        if pdf_paths:
+            for pdf_path in pdf_paths:
+                with open(pdf_path, "rb") as f:
+                    raw_text += get_pdf_text([f])
+            text_chunks = get_text_chunks(raw_text)
+            vector_store = get_vector_store(text_chunks)
+            vector_store_loaded = True
+            logger.info("PDF reading and processing completed. Ready for POST requests.")
+        else:
+            logger.warning("No PDFs to process")
+            vector_store_loaded = False
+    except Exception as e:
+        logger.error(f"Error during startup: {e}")
+        vector_store_loaded = False
+    
+    yield
+
+app = fastapi.FastAPI(lifespan=lifespan)
 
 # cors 
 # cors issues
@@ -80,25 +122,8 @@ class PDFRequest(BaseModel):
     subject: Optional[str] = None
     content: Optional[str] = None
 
-pdf_paths = ["source/Ellis_Horowitz,_Sartaj_SahniFundamentals_of_Computers_algorithms.pdf"]
 vector_store = None
 vector_store_loaded = False  # Flag to track if the vector store has been loaded
-
-@app.on_event("startup")
-async def startup():
-    global vector_store, vector_store_loaded
-    raw_text = ""
-    try:
-        for pdf_path in pdf_paths:
-            with open(pdf_path, "rb") as f:
-                raw_text += get_pdf_text([f])
-        text_chunks = get_text_chunks(raw_text)
-        vector_store = get_vector_store(text_chunks)
-        vector_store_loaded = True
-        print("PDF reading and processing completed. Ready for POST requests.")
-    except Exception as e:
-        print(f"Error during startup: {e}")
-        vector_store_loaded = False
 
 @app.post("/process_pdf")
 async def process_pdf(request: PDFRequest):
@@ -140,5 +165,5 @@ def streamlit_interface():
                 st.write("PDF reading and processing is finished. Ready for querying.")
                 
 if __name__ == "__main__":
-    import uvicorn  # type: ignore
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
