@@ -12,15 +12,15 @@ from dotenv import load_dotenv  # type: ignore
 import fastapi  # type: ignore
 from fastapi import HTTPException  # type: ignore
 from pydantic import BaseModel
-from typing import List , Optional
-from fastapi.middleware.cors import CORSMiddleware # type: ignore
+from typing import List, Optional
+from fastapi.middleware.cors import CORSMiddleware  # type: ignore
 from contextlib import asynccontextmanager
 from loguru import logger
+import ngrok
 import sys
 from pathlib import Path
 
-# this is a test
-
+# Load environment variables
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
@@ -29,11 +29,19 @@ if not GOOGLE_API_KEY:
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
+# Ngrok configuration
+NGROK_AUTH_TOKEN = os.getenv("NGROK_AUTH_TOKEN")
+if not NGROK_AUTH_TOKEN:
+    logger.error("NGROK_AUTH_TOKEN not found in environment variables")
+    sys.exit(1)
+
 PORT = int(os.getenv("PORT", "8000"))
 
+# Create source directory if it doesn't exist
 source_dir = Path("source")
 source_dir.mkdir(exist_ok=True)
 
+# Update PDF paths to be more flexible
 pdf_paths = []
 if os.path.exists(source_dir):
     pdf_paths = [str(p) for p in source_dir.glob("*.pdf")]
@@ -84,6 +92,19 @@ def user_input(user_question):
 
 @asynccontextmanager
 async def lifespan(app: fastapi.FastAPI):
+    # Set up ngrok
+    try:
+        logger.info("Setting up Ngrok Tunnel")
+        ngrok.set_auth_token(NGROK_AUTH_TOKEN)
+        logger.info(f"Using Ngrok auth token: {'*' * len(NGROK_AUTH_TOKEN)}")
+        
+        # Connect to ngrok
+        listener = await ngrok.connect(PORT, authtoken=NGROK_AUTH_TOKEN)
+        logger.info(f"Ngrok tunnel established at: {listener.url()}")
+    except Exception as e:
+        logger.error(f"Failed to setup ngrok tunnel: {str(e)}")
+        raise
+
     # Initialize vector store
     global vector_store, vector_store_loaded
     raw_text = ""
@@ -104,6 +125,13 @@ async def lifespan(app: fastapi.FastAPI):
         vector_store_loaded = False
     
     yield
+    
+    # Cleanup ngrok
+    try:
+        logger.info("Tearing Down Ngrok Tunnel")
+        await ngrok.disconnect()
+    except Exception as e:
+        logger.error(f"Error during ngrok shutdown: {str(e)}")
 
 app = fastapi.FastAPI(lifespan=lifespan)
 
@@ -166,4 +194,4 @@ def streamlit_interface():
                 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run("Gemini:app", host="127.0.0.1", port=PORT, reload=True)
