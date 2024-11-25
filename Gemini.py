@@ -15,6 +15,8 @@ from pydantic import BaseModel
 from typing import List , Optional
 from fastapi.middleware.cors import CORSMiddleware # type: ignore
 
+# this is a test
+
 load_dotenv()
 os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
