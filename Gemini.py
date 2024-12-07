@@ -19,6 +19,7 @@ from loguru import logger
 import ngrok
 import sys
 from pathlib import Path
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Load environment variables
 load_dotenv()
@@ -90,48 +91,61 @@ def user_input(user_question):
     response = chain({"input_documents": docs, "question": user_question}, return_only_outputs=True)
     return response["output_text"]
 
-@asynccontextmanager
-async def lifespan(app: fastapi.FastAPI):
-    # Set up ngrok
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+async def setup_ngrok(port: int, auth_token: str):
     try:
-        logger.info("Setting up Ngrok Tunnel")
-        ngrok.set_auth_token(NGROK_AUTH_TOKEN)
-        logger.info(f"Using Ngrok auth token: {'*' * len(NGROK_AUTH_TOKEN)}")
+        # Ensure we're starting with a clean state
+        await ngrok.kill()
+        
+        # Set the auth token
+        ngrok.set_auth_token(auth_token)
         
         # Connect to ngrok
-        listener = await ngrok.connect(PORT, authtoken=NGROK_AUTH_TOKEN)
-        logger.info(f"Ngrok tunnel established at: {listener.url()}")
+        listener = await ngrok.connect(port, authtoken=auth_token)
+        return listener
     except Exception as e:
-        logger.error(f"Failed to setup ngrok tunnel: {str(e)}")
+        logger.error(f"Ngrok connection attempt failed: {str(e)}")
         raise
 
-    # Initialize vector store
-    global vector_store, vector_store_loaded
-    raw_text = ""
+@asynccontextmanager
+async def lifespan(app: fastapi.FastAPI):
+    listener = None
     try:
-        if pdf_paths:
-            for pdf_path in pdf_paths:
-                with open(pdf_path, "rb") as f:
-                    raw_text += get_pdf_text([f])
-            text_chunks = get_text_chunks(raw_text)
-            vector_store = get_vector_store(text_chunks)
-            vector_store_loaded = True
-            logger.info("PDF reading and processing completed. Ready for POST requests.")
-        else:
-            logger.warning("No PDFs to process")
+        logger.info("Setting up Ngrok Tunnel")
+        logger.info(f"Using Ngrok auth token: {'*' * len(NGROK_AUTH_TOKEN)}")
+        
+        # Connect to ngrok with retry logic
+        listener = await setup_ngrok(PORT, NGROK_AUTH_TOKEN)
+        logger.info(f"Ngrok tunnel established at: {listener.url()}")
+        
+        # Initialize vector store
+        global vector_store, vector_store_loaded
+        raw_text = ""
+        try:
+            if pdf_paths:
+                for pdf_path in pdf_paths:
+                    with open(pdf_path, "rb") as f:
+                        raw_text += get_pdf_text([f])
+                text_chunks = get_text_chunks(raw_text)
+                vector_store = get_vector_store(text_chunks)
+                vector_store_loaded = True
+                logger.info("PDF reading and processing completed. Ready for POST requests.")
+            else:
+                logger.warning("No PDFs to process")
+                vector_store_loaded = False
+        except Exception as e:
+            logger.error(f"Error during startup: {e}")
             vector_store_loaded = False
-    except Exception as e:
-        logger.error(f"Error during startup: {e}")
-        vector_store_loaded = False
-    
-    yield
-    
-    # Cleanup ngrok
-    try:
-        logger.info("Tearing Down Ngrok Tunnel")
-        await ngrok.disconnect()
-    except Exception as e:
-        logger.error(f"Error during ngrok shutdown: {str(e)}")
+        
+        yield
+        
+    finally:
+        # Cleanup ngrok
+        try:
+            logger.info("Tearing Down Ngrok Tunnel")
+            await ngrok.disconnect()
+        except Exception as e:
+            logger.error(f"Error during ngrok shutdown: {str(e)}")
 
 app = fastapi.FastAPI(lifespan=lifespan)
 
