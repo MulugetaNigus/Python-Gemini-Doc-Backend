@@ -16,10 +16,7 @@ from typing import List, Optional
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore
 from contextlib import asynccontextmanager
 from loguru import logger
-import ngrok
 import sys
-from pathlib import Path
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Load environment variables
 load_dotenv()
@@ -28,27 +25,20 @@ if not GOOGLE_API_KEY:
     logger.error("GOOGLE_API_KEY not found in environment variables")
     sys.exit(1)
 
+# get the env variable from the .env file
 genai.configure(api_key=GOOGLE_API_KEY)
-
-# Ngrok configuration
-NGROK_AUTH_TOKEN = os.getenv("NGROK_AUTH_TOKEN")
-if not NGROK_AUTH_TOKEN:
-    logger.error("NGROK_AUTH_TOKEN not found in environment variables")
-    sys.exit(1)
-
 PORT = int(os.getenv("PORT", "8000"))
 
-# Create source directory if it doesn't exist
-source_dir = Path("source")
-source_dir.mkdir(exist_ok=True)
+# Subject mapping
+subject_mapping = {
+    "flutter": ["source/flutter_tutorial.pdf"],
+    "embedded": ["source/Lecture 1.pdf"],
+}
 
-# Update PDF paths to be more flexible
-pdf_paths = []
-if os.path.exists(source_dir):
-    pdf_paths = [str(p) for p in source_dir.glob("*.pdf")]
-    if not pdf_paths:
-        logger.warning("No PDF files found in source directory")
+# Define pdf_paths based on subject_mapping
+pdf_paths = [pdf for subject in subject_mapping.values() for pdf in subject]
 
+# get the content from the pdf file
 def get_pdf_text(pdf_docs):
     text = ""
     for pdf in pdf_docs:
@@ -57,33 +47,38 @@ def get_pdf_text(pdf_docs):
             text += page.extract_text()
     return text
 
+# chunk the content
 def get_text_chunks(text):
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
     chunks = text_splitter.split_text(text)
     return chunks
 
+# vectorization
 def get_vector_store(text_chunks):
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
     vector_store.save_local("faiss_index")
     return vector_store
 
+# define the conversation schema
 def get_conversational_chain():
     prompt_template = """
     Answer the question as detailed as possible from the provided context, make sure to provide all the details, if the answer is not in
-    provided context just say, "answer is not available in the context", don't provide the wrong answer, but use your back knowledge ans answer the user question as much as possible even if the content is not provided\n\n
+    provided context just say, "answer is not available in the context try different questions", don't provide the wrong answer, \n\n
     Context:\n {context}?\n
     Question: \n{question}\n
 
     Answer:
     """
 
+    # the main ai engine for the capabilities of the process the pdf content
     model = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.3)
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
     chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
     return chain
 
-def user_input(user_question):
+# get the user input
+def user_input(user_question, pdf_docs):
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
     docs = new_db.similarity_search(user_question)
@@ -91,33 +86,11 @@ def user_input(user_question):
     response = chain({"input_documents": docs, "question": user_question}, return_only_outputs=True)
     return response["output_text"]
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-async def setup_ngrok(port: int, auth_token: str):
-    try:
-        # Ensure we're starting with a clean state
-        await ngrok.kill()
-        
-        # Set the auth token
-        ngrok.set_auth_token(auth_token)
-        
-        # Connect to ngrok
-        listener = await ngrok.connect(port, authtoken=auth_token)
-        return listener
-    except Exception as e:
-        logger.error(f"Ngrok connection attempt failed: {str(e)}")
-        raise
-
+# start looking for to start the pdf read
 @asynccontextmanager
 async def lifespan(app: fastapi.FastAPI):
     listener = None
     try:
-        logger.info("Setting up Ngrok Tunnel")
-        logger.info(f"Using Ngrok auth token: {'*' * len(NGROK_AUTH_TOKEN)}")
-        
-        # Connect to ngrok with retry logic
-        listener = await setup_ngrok(PORT, NGROK_AUTH_TOKEN)
-        logger.info(f"Ngrok tunnel established at: {listener.url()}")
-        
         # Initialize vector store
         global vector_store, vector_store_loaded
         raw_text = ""
@@ -140,17 +113,16 @@ async def lifespan(app: fastapi.FastAPI):
         yield
         
     finally:
-        # Cleanup ngrok
+        # Cleanup
         try:
-            logger.info("Tearing Down Ngrok Tunnel")
-            await ngrok.disconnect()
+            logger.info("Something went wrong")
         except Exception as e:
-            logger.error(f"Error during ngrok shutdown: {str(e)}")
+            logger.error(f"Error during startups: {str(e)}")
 
+# init the fastAPI
 app = fastapi.FastAPI(lifespan=lifespan)
 
 # cors 
-# cors issues
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -159,53 +131,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# our pydantic model
 class PDFRequest(BaseModel):
     question: str     
     subject: Optional[str] = None
-    content: Optional[str] = None
 
+# vectors
 vector_store = None
-vector_store_loaded = False  # Flag to track if the vector store has been loaded
+vector_store_loaded = False
 
+# a fast api endpoints for the pdf processing
 @app.post("/process_pdf")
 async def process_pdf(request: PDFRequest):
     try:
         if not vector_store_loaded:
             raise HTTPException(status_code=500, detail="Vector store not loaded. Please try again later.")
+        
+        # Get the subject and corresponding PDF paths
+        subject = request.subject
+        if subject not in subject_mapping:
+            raise HTTPException(status_code=400, detail="Invalid subject provided.")
+        
+        pdf_paths = subject_mapping[subject]
+        raw_text = get_pdf_text(pdf_paths)
+        text_chunks = get_text_chunks(raw_text)
+        vector_store = get_vector_store(text_chunks)
+
         question = request.question
-        answer = user_input(question)
+        answer = user_input(question, pdf_paths)
         return {"answer": answer}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# get request test
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the PDF Question Answering API!"}
-
-def streamlit_interface():
-    st.set_page_config("Chat PDF")
-    st.header("Multi-PDF Chat using Gemini")
-
-    user_question = st.text_input("Ask a Question from the PDF Files")
-
-    if user_question:
-        user_input(user_question)
-
-    with st.sidebar:
-        st.title("Menu:")
-        st.write(f"PDF Files defined in code: {', '.join(pdf_paths)}")
-
-        if st.button("Submit & Process"):
-            with st.spinner("Processing..."):
-                raw_text = ""
-                for pdf_path in pdf_paths:
-                    with open(pdf_path, "rb") as f:
-                        raw_text += get_pdf_text([f])
-                text_chunks = get_text_chunks(raw_text)
-                get_vector_store(text_chunks)
-                st.success("Done")
-                st.write("PDF reading and processing is finished. Ready for querying.")
                 
+# main entry
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("Gemini:app", host="127.0.0.1", port=PORT, reload=True)
